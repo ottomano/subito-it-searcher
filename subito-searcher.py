@@ -51,6 +51,8 @@ def main() -> None:
         )
     )
     logging.getLogger().addHandler(file_handler)
+    # httpx logs every request URL at INFO, and Telegram URLs embed the bot token
+    logging.getLogger("httpx").setLevel(logging.WARNING)
 
     queries = storage.load_queries()
     credentials = storage.load_api_credentials()

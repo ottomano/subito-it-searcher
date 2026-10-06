@@ -26,6 +26,7 @@ import time as t
 
 from telegram import Update
 from telegram.constants import ParseMode
+from telegram.error import NetworkError
 from telegram.ext import Application, ApplicationBuilder, CommandHandler, ContextTypes
 
 from subito import queries as q
@@ -197,32 +198,46 @@ async def _polling_loop(app: Application) -> None:
         state = app.bot_data
         now = datetime.now().time()
         if _in_between(now, time(state["active_hour"]), time(state["pause_hour"])):
-            all_msgs = _run_all_queries(state)
+            # Any exception escaping here would kill this task silently while the
+            # command handlers keep running, so the bot would look alive but never
+            # search again. Skip the cycle and retry after the usual delay instead.
+            try:
+                all_msgs = _run_all_queries(state)
 
-            if all_msgs is None:
-                sleep_h = state["bot_detection_sleep"] // 3600
-                await app.bot.send_message(
-                    chat_id=state["credentials"]["chatid"],
-                    text=(
-                        f"Bot detection triggered. Polling paused for {sleep_h}h, "
-                        "then will resume automatically."
-                    ),
-                )
-                await asyncio.sleep(state["bot_detection_sleep"])
-                continue
-            elif notify and all_msgs:
-                for m in all_msgs:
+                if all_msgs is None:
+                    sleep_h = state["bot_detection_sleep"] // 3600
                     await app.bot.send_message(
                         chat_id=state["credentials"]["chatid"],
-                        text=m,
-                        parse_mode=ParseMode.MARKDOWN,
+                        text=(
+                            f"Bot detection triggered. Polling paused for {sleep_h}h, "
+                            "then will resume automatically."
+                        ),
                     )
+                    await asyncio.sleep(state["bot_detection_sleep"])
+                    continue
+                elif notify and all_msgs:
+                    for m in all_msgs:
+                        await app.bot.send_message(
+                            chat_id=state["credentials"]["chatid"],
+                            text=m,
+                            parse_mode=ParseMode.MARKDOWN,
+                        )
 
-            storage.save_queries(state["queries"])
-            state["last_run"] = datetime.now()
-            notify = True
+                storage.save_queries(state["queries"])
+                state["last_run"] = datetime.now()
+                notify = True
+            except Exception:
+                logger.exception("Polling cycle failed, retrying after the delay")
 
         await asyncio.sleep(state["delay"])
+
+
+async def _error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Log handler and getUpdates errors; network blips get one line, no traceback."""
+    if isinstance(context.error, NetworkError):
+        logger.warning(f"Telegram network error: {context.error}")
+    else:
+        logger.error("Unhandled error in bot handler", exc_info=context.error)
 
 
 async def _post_init(app: Application) -> None:
@@ -261,6 +276,7 @@ def run_bot(
     app.add_handler(CommandHandler("delete", cmd_delete))
     app.add_handler(CommandHandler("refresh", cmd_refresh))
     app.add_handler(CommandHandler("status", cmd_status))
+    app.add_error_handler(_error_handler)
 
     logger.info("Bot started. Waiting for commands...")
     app.run_polling()
