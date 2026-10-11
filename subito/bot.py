@@ -13,6 +13,9 @@ Users:
   RESTRICT_BOT_TO_CHATID unset  every chat is its own user and receives its
                                 notifications in the same chat
 
+The command menu shown by Telegram clients is registered at startup with
+set_my_commands, scoped to the restricted chat when RESTRICT_BOT_TO_CHATID is set.
+
 /refresh and the initial fetch of /add run Scraper.run in a worker thread
 (asyncio.to_thread) without waiting for the lock, so a busy or paused scraper is
 reported instead of stalling the command.
@@ -22,9 +25,9 @@ import asyncio
 import logging
 import threading
 
-from telegram import Update
+from telegram import BotCommand, BotCommandScopeChat, BotCommandScopeDefault, Update
 from telegram.constants import ParseMode
-from telegram.error import NetworkError
+from telegram.error import NetworkError, TelegramError
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -195,7 +198,32 @@ async def _error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> 
         logger.error("Unhandled error in bot handler", exc_info=context.error)
 
 
+# Command menu shown by Telegram clients (/start is left out, as usual)
+MENU = [
+    BotCommand("list", "Show your searches"),
+    BotCommand("add", "Add a search: <name words> <url> [min] [max] [tuttosubito]"),
+    BotCommand("delete", "Remove a search: <name>"),
+    BotCommand("refresh", "Run your searches now"),
+    BotCommand("status", "Show daemon state"),
+    BotCommand("help", "Show the available commands"),
+]
+
+
+async def _set_menu(app: Application) -> None:
+    """Register the command menu; a failure only loses the menu, never the bot."""
+    chat_id = app.bot_data["cfg"].restrict_to_chat_id
+    if chat_id is not None:
+        scope = BotCommandScopeChat(chat_id)
+    else:
+        scope = BotCommandScopeDefault()
+    try:
+        await app.bot.set_my_commands(MENU, scope=scope)
+    except TelegramError as e:
+        logger.warning(f"Could not register the command menu: {e}")
+
+
 async def _post_init(app: Application) -> None:
+    await _set_menu(app)
     scraper = app.bot_data["scraper"]
     threading.Thread(target=scraper.loop, name="polling", daemon=True).start()
 
