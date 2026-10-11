@@ -2,9 +2,10 @@
 
 ## What this project does
 
-Scrapes subito.it (Italian classifieds) for search queries, diffs results against a local
-cache, and pushes new listings via Telegram and/or ntfy. Runs as a continuous polling loop
-(default), a one-shot refresh, or an interactive Telegram bot.
+Scrapes subito.it (Italian classifieds) for search queries, diffs results against the
+items stored in SQLite, and delivers new listings to N independent output channels
+(Telegram, ntfy, Windows toast). A Telegram bot can additionally manage the searches
+from a chat; without it, searches are managed from the CLI.
 
 ## Running the project
 
@@ -14,20 +15,20 @@ python3 subito-searcher.py --help
 python3 subito-searcher.py <subcommand> --help
 ```
 
-No build step. State files are created automatically under `data/` on first run.
+No build step. `data/subito.db` is created automatically on first run.
 
 ## Module map
 
 | File | Role |
 | --- | --- |
-| `subito-searcher.py` | Entry point: parse args, load state, dispatch |
-| `subito/scraper.py` | Core: fetch, parse, diff. First file to check when the site breaks |
-| `subito/notifications.py` | Telegram and ntfy channels, independent of each other |
-| `subito/bot.py` | Interactive Telegram bot daemon (python-telegram-bot v22) |
-| `subito/queries.py` | add, delete, print helpers |
-| `subito/storage.py` | Load/save JSON state + env var overlay + `migrate_queries()` |
+| `subito-searcher.py` | Entry point: parse args, build `AppConfig`, dispatch |
+| `subito/scraper.py` | Core: fetch, parse, diff + `Scraper` runtime (loop, lock, pause, delivery). First file to check when the site breaks |
+| `subito/notifications.py` | Output channels (telegram, ntfy, windows) and `build_channels()` |
+| `subito/bot.py` | Telegram command interface (python-telegram-bot v22) |
+| `subito/queries.py` | Search formatting, print and price parsing helpers |
+| `subito/storage.py` | SQLite schema and queries + legacy JSON import |
 | `subito/cli.py` | Subcommands and top-level flags |
-| `subito/config.py` | `DATA_DIR`, file paths, `AppConfig` dataclass |
+| `subito/config.py` | `DATA_DIR`, `DB_PATH`, `AppConfig` dataclass |
 
 ## CLI structure
 
@@ -35,31 +36,34 @@ No build step. State files are created automatically under `data/` on first run.
 
 ```bash
 python3 subito-searcher.py add <name> <url> [--min-price N] [--max-price N] [--tuttosubito]
-python3 subito-searcher.py delete <name>
-python3 subito-searcher.py list [--short]
-python3 subito-searcher.py migrate
+                                  [--chat-id ID]
+python3 subito-searcher.py delete <name> [--chat-id ID]
+python3 subito-searcher.py list [--short] [--chat-id ID | --all]
+python3 subito-searcher.py migrate [--chat-id ID]
 python3 subito-searcher.py setup [--telegram-token T] [--telegram-chat-id ID]
-                                  [--ntfy-server S] [--ntfy-topic T]
+                                  [--ntfy-server S --ntfy-topic T]
 ```
 
-**Top-level flags** (run modes):
+Without `--chat-id` the subcommands act on the default user (see Users below).
+
+**Run modes**:
 
 ```bash
-python3 subito-searcher.py              # default: start polling loop
-python3 subito-searcher.py --refresh    # run once and exit
-python3 subito-searcher.py --bot        # interactive Telegram bot
+python3 subito-searcher.py              # polling loop + Telegram bot if a token is set
+python3 subito-searcher.py --no-bot     # polling loop only, no Telegram commands
+python3 subito-searcher.py --refresh    # run every user's searches once and exit
 python3 subito-searcher.py --delay 30 --active-hour 8 --pause-hour 23
 python3 subito-searcher.py --query-delay 60        # seconds between queries (default: 60)
 python3 subito-searcher.py --bot-detection-sleep 86400  # sleep on bot detection (default: 86400)
 ```
 
-**Notification flags** (per-run):
-`--tgoff`, `--ntfyoff`, `--winoff`
+**Output channel flags**: `--tgoff`, `--ntfyoff`, `--winoff`. `--tgoff` only stops
+Telegram notifications; the bot still answers commands.
 
 ## Configuration priority
 
 ```text
-CLI flags > env vars > config files > defaults
+CLI flags > env vars > database > defaults
 ```
 
 Environment variables:
@@ -67,7 +71,7 @@ Environment variables:
 | Variable | Description |
 | --- | --- |
 | `TELEGRAM_TOKEN` | Telegram bot API token |
-| `TELEGRAM_CHAT_ID` | Telegram chat id |
+| `TELEGRAM_CHAT_ID` | Chat or `@channel` receiving the default user's notifications |
 | `NTFY_SERVER` | ntfy server URL |
 | `NTFY_TOPIC` | ntfy topic |
 | `DELAY` | Polling interval in seconds (default: 120) |
@@ -75,6 +79,7 @@ Environment variables:
 | `PAUSE_HOUR` | Hour when to stop polling in 24h notation |
 | `QUERY_DELAY` | Seconds to wait between queries to avoid anti-bot detection (default: 60) |
 | `BOT_DETECTION_SLEEP` | Seconds to sleep after bot detection (default: 86400) |
+| `RESTRICT_BOT_TO_CHATID` | If set, the bot answers only this chat id; unset means open to anyone. Also the fallback for `TELEGRAM_CHAT_ID` |
 
 ## Data files
 
@@ -82,43 +87,42 @@ All files live in `data/` (gitignored, mounted as Docker volume):
 
 | File | Content |
 | --- | --- |
-| `searches.json` | All saved searches and found items |
-| `telegram.json` | Bot token and chat id |
-| `ntfy.json` | Server URL and topic |
+| `subito.db` | SQLite database (WAL mode, so also `subito.db-wal` / `-shm`) |
 | `errors.log` | WARNING+ log records, rotating 1 MB x 3 backups |
+| `searches.json`, `telegram.json`, `ntfy.json` | Legacy state, read only by `migrate` |
 
-## Data shape
+## Data model
 
-```json
-{
-  "Auto": {
-    "url": "https://www.subito.it/...",
-    "min_price": 50,
-    "max_price": 200,
-    "shipping_only": false,
-    "tuttosubito_only": true,
-    "items": {
-      "https://www.subito.it/item-link": {
-        "title": "Fiat Punto",
-        "price": 120,
-        "location": "Milano (MI)",
-        "date": "30-05-2026 12:56:20",
-        "shipping": true,
-        "tuttosubito": true,
-        "verified_dealer": false
-      }
-    }
-  }
-}
-```
+| Table | Content |
+| --- | --- |
+| `settings` | Global key/value pairs: `telegram_token`, `telegram_chat_id`, `ntfy_server`, `ntfy_topic` |
+| `users` | `id`, `telegram_chat_id` (`TEXT`, can be `@channel`; `NULL` = local user) |
+| `searches` | `user_id`, `name`, `url`, `min_price`, `max_price`, `tuttosubito_only`, `last_checked`; unique by `(user_id, name)` |
+| `items` | Listings per search, keyed by `(search_id, link)` |
 
-- `min_price` / `max_price` are `int` or `null`, never the string `"null"`
+- `min_price` / `max_price` are `INTEGER` or `NULL`. They are a local filter inherited
+  from the original 2019 project: they let a user change the price range without
+  editing the URL or resetting the stored items. Keep them
 - `tuttosubito_only` is a boolean, filter applied during scraping
 - Use `&shp=true` in the URL for shipping-only results (native subito.it filter)
-- `items` is keyed by the listing URL, one entry per unique listing found
-- Each item stores: `title`, `price`, `location`, `date`, `shipping`, `tuttosubito`,
-  `verified_dealer`
-- Run `python3 subito-searcher.py migrate` once to convert files written by older versions
+- Each item stores: `title`, `price` (`NULL` when unknown), `location`, `date`,
+  `shipping`, `tuttosubito`, `verified_dealer`
+- `last_checked IS NULL` means never fetched: the first fetch stores items without
+  notifying them, so a new search does not flood the chat
+- Deleting a search cascades to its items
+- Run `python3 subito-searcher.py migrate` once to import files written by older
+  versions; it also converts the oldest nested JSON format
+
+## Users
+
+- The default user is the one whose `telegram_chat_id` is `TELEGRAM_CHAT_ID` (env >
+  settings), falling back to `RESTRICT_BOT_TO_CHATID`, then to the local user
+  (`telegram_chat_id NULL`, for setups without Telegram)
+- CLI subcommands without `--chat-id` act on the default user; read-only ones never
+  create users
+- Bot with `RESTRICT_BOT_TO_CHATID`: only that chat is accepted and it acts on the
+  default user
+- Bot without it: every chat is its own user and receives notifications in the chat
 
 ## Tooling
 
@@ -138,7 +142,7 @@ python -m ruff check --fix subito/ subito-searcher.py
   snake_case
 - f-strings for all string formatting including logger calls
 - Doc/comment lines: maximum 88 characters
-- No globals: state dicts loaded in `main()` and passed explicitly
+- No globals: config built in `main()` and passed explicitly; state lives in SQLite
 - `AppConfig` replaces passing `argparse.Namespace` into modules
 - `print()` only in `queries.py` display functions; everything else uses `logging`
 - Log levels: `INFO` normal flow, `DEBUG` per-item detail, `WARNING` network errors,
@@ -187,17 +191,36 @@ What helps avoid triggering DataDome:
 With ~50 tracked searches even 60s between queries may still trigger DataDome over time.
 A working strategy from community testing: 3 queries per run, 60s apart, every 15 minutes.
 
-## Notifications
+## Output channels
 
-Telegram and ntfy are checked independently in `run_query()`. Both fire if both are
-configured. The `is_*_active()` guards in `notifications.py` check that credentials exist
-and the off-flag is not set.
+`notifications.build_channels(cfg, token)` returns the enabled channels, each with
+`name`, `accepts(user, is_default)` and `send(user, messages)`:
 
-Known limitation: `send_telegram_messages()` builds a GET URL with message text inline,
-which can break on special characters. A fix would switch to POST with a JSON body.
+| Channel | Enabled when | Receives |
+| --- | --- | --- |
+| `telegram` | token set, no `--tgoff` | every user with a `telegram_chat_id` (HTTP POST, plain-text fallback if Markdown fails) |
+| `ntfy` | server + topic set, no `--ntfyoff` | default user only |
+| `windows` | on Windows with `win10toast` installed, no `--winoff` | default user only |
+
+To add a channel: a class with the same shape, an entry in `build_channels()`, an
+`--<name>off` flag in `cli.py` and a field in `AppConfig`.
+
+## Scraper runtime
+
+`scraper.Scraper(cfg, token)` is used by every mode:
+
+- `run(searches, wait=True)`: takes `lock`, runs `run_searches()`, delivers each user's
+  messages to the channels that accept that user, pauses on bot detection and notifies
+  every user with searches. Returns `(new items, blocked)` or `None` if paused or, with
+  `wait=False`, busy
+- `loop()`: polls every user's searches inside the active window, honours the pause
+- `lock` (`threading.Lock`) ensures one scraping run at a time: DataDome tracks the
+  IP, not the user
 
 ## Bot mode
 
-`--bot` uses `python-telegram-bot` v22 (async). The polling loop runs as an
-`asyncio.Task` inside the PTB event loop, no threads. Shared state lives in `app.bot_data`.
-The same Telegram token handles both push notifications and command responses.
+The bot (`python-telegram-bot` v22, `concurrent_updates`) only handles commands:
+`/list`, `/add`, `/delete`, `/refresh`, `/status`, `/help`. `Scraper.loop()` runs in a
+daemon thread started in `post_init`; `/refresh` and the initial fetch of `/add` call
+`Scraper.run(..., wait=False)` through `asyncio.to_thread`. Notifications reach
+Telegram through the `telegram` channel, never through PTB.

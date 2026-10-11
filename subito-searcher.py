@@ -1,32 +1,37 @@
 #!/usr/bin/env python3
-"""Entry point: parse args, load state, dispatch.
+"""Entry point: parse args, build config, dispatch.
 
 Nothing else lives here. All logic is in the subito/ package.
 Run with --help to see all options.
 """
 
-from datetime import datetime, time
 import logging
 import logging.handlers
 import os
-import time as t
 
-from subito import notifications, scraper, storage
 from subito import queries as q
+from subito import scraper, storage
 from subito.bot import run_bot
 from subito.cli import build_parser
-from subito.config import DATA_DIR, AppConfig
+from subito.config import DATA_DIR, LEGACY_SEARCHES_FILE, AppConfig
 
 logger = logging.getLogger(__name__)
 
 
-def _in_between(now: time, start: time, end: time) -> bool:
-    if start < end:
-        return start <= now < end
-    elif start == end:
-        return True
-    else:
-        return start <= now or now < end
+def _env_int(name: str, default: int | None) -> int | None:
+    value = os.environ.get(name)
+    return int(value) if value else default
+
+
+def _pick(flag: int | None, env: str, default: int | None) -> int | None:
+    """Priority: CLI flag > env var > default."""
+    return flag if flag is not None else _env_int(env, default)
+
+
+def _user(args, create: bool = True) -> dict | None:
+    """User selected by --chat-id, or the default user."""
+    chat_id = args.chat_id if args.chat_id is not None else storage.default_chat_id()
+    return storage.user_for_chat(chat_id, create)
 
 
 def main() -> None:
@@ -54,133 +59,111 @@ def main() -> None:
     # httpx logs every request URL at INFO, and Telegram URLs embed the bot token
     logging.getLogger("httpx").setLevel(logging.WARNING)
 
-    queries = storage.load_queries()
-    credentials = storage.load_api_credentials()
-    ntfy_config = storage.load_ntfy_config()
-
-    # Priority: CLI flag > env var > default
-    delay = args.delay or int(os.environ.get("DELAY", 120))
-    active_hour = args.active_hour or int(os.environ.get("ACTIVE_HOUR", 0))
-    pause_hour = args.pause_hour or int(os.environ.get("PAUSE_HOUR", 0))
-    query_delay = (
-        args.query_delay
-        if args.query_delay is not None
-        else int(os.environ.get("QUERY_DELAY", 60))
-    )
-    bot_detection_sleep = (
-        args.bot_detection_sleep
-        if args.bot_detection_sleep is not None
-        else int(os.environ.get("BOT_DETECTION_SLEEP", 86400))
-    )
+    storage.init_db()
 
     cfg = AppConfig(
         tgoff=args.tgoff,
         ntfyoff=args.ntfyoff,
-        win_notifyoff=args.win_notifyoff,
-        query_delay=query_delay,
-        bot_detection_sleep=bot_detection_sleep,
+        winoff=args.winoff,
+        no_bot=args.no_bot,
+        delay=_pick(args.delay, "DELAY", 120),
+        active_hour=_pick(args.active_hour, "ACTIVE_HOUR", 0),
+        pause_hour=_pick(args.pause_hour, "PAUSE_HOUR", 0),
+        query_delay=_pick(args.query_delay, "QUERY_DELAY", 60),
+        bot_detection_sleep=_pick(
+            args.bot_detection_sleep, "BOT_DETECTION_SLEEP", 86400
+        ),
+        restrict_to_chat_id=_env_int("RESTRICT_BOT_TO_CHATID", None),
     )
 
     # Subcommands
 
     if args.command == "add":
-        q.add(
-            queries,
-            args.url,
+        search = storage.add_search(
+            _user(args)["id"],
             args.name,
+            args.url,
             args.min_price,
             args.max_price,
             tuttosubito_only=args.tuttosubito_only,
         )
-        scraper.run_query(
-            args.name, queries[args.name], False, cfg, credentials, ntfy_config
-        )
-        storage.save_queries(queries)
+        # First fetch stores the current listings without notifying them
+        scraper.run_searches([search], cfg)
         logger.info(f"Search '{args.name}' added.")
         return
 
     if args.command == "delete":
-        q.delete(queries, args.name)
-        storage.save_queries(queries)
-        logger.info(f"Search '{args.name}' deleted.")
+        user = _user(args, create=False)
+        if user and storage.delete_search(user["id"], args.name):
+            logger.info(f"Search '{args.name}' deleted.")
+        else:
+            logger.error(f"No search named '{args.name}'.")
         return
 
     if args.command == "list":
-        if args.short:
-            q.print_list_short(queries)
+        if args.all:
+            searches = storage.list_searches()
         else:
-            q.print_list(queries)
+            user = _user(args, create=False)
+            searches = storage.list_searches(user["id"]) if user else []
+        if args.short:
+            q.print_list_short(searches)
+        else:
+            q.print_list(searches)
         return
 
     if args.command == "migrate":
+        for r in storage.migrate_files():
+            logger.info(f"Renamed: {r}")
         confirm = input(
-            "Migrate data files and search format? This will rename files and "
-            "overwrite searches.json. [Y/n] "
+            "Import searches.json, telegram.json and ntfy.json into the database? "
+            "Searches with the same name are replaced. [Y/n] "
         )
         if confirm.strip() != "Y":
             logger.info("Migration cancelled.")
             return
-        renamed = storage.migrate_files()
-        for r in renamed:
-            logger.info(f"Renamed: {r}")
-        queries = storage.load_queries()
-        migrated = storage.migrate_queries(queries)
-        storage.save_queries(migrated)
-        logger.info(f"Migrated {len(migrated)} search(es).")
+        count = storage.import_legacy_json(args.chat_id)
+        owner = storage.default_chat_id() if args.chat_id is None else args.chat_id
+        logger.info(
+            f"Imported {count} search(es) for {owner or 'the local user'}. "
+            "The JSON files can now be removed."
+        )
         return
 
     if args.command == "setup":
-        if args.token and args.chatid:
-            credentials["token"] = args.token
-            credentials["chatid"] = args.chatid
-            storage.save_api_credentials(credentials)
-            logger.info("Telegram credentials saved.")
+        if args.token:
+            storage.set_setting("telegram_token", args.token)
+            logger.info("Telegram token saved.")
+        if args.telegram_chat_id:
+            storage.set_setting("telegram_chat_id", args.telegram_chat_id)
+            logger.info("Telegram chat id saved.")
         if args.ntfy_server and args.ntfy_topic:
-            ntfy_config["ntfy_server"] = args.ntfy_server
-            ntfy_config["ntfy_topic"] = args.ntfy_topic
-            storage.save_ntfy_config(ntfy_config)
+            storage.set_setting("ntfy_server", args.ntfy_server)
+            storage.set_setting("ntfy_topic", args.ntfy_topic)
             logger.info("ntfy config saved.")
         return
 
     # Run modes
 
-    if args.refresh:
-        scraper.refresh(queries, True, cfg, credentials, ntfy_config)
-        storage.save_queries(queries)
-        return
-
-    if args.bot:
-        run_bot(
-            queries=queries,
-            credentials=credentials,
-            ntfy_config=ntfy_config,
-            cfg=cfg,
-            delay=delay,
-            active_hour=active_hour,
-            pause_hour=pause_hour,
+    if not storage.list_searches() and os.path.isfile(LEGACY_SEARCHES_FILE):
+        logger.warning(
+            "searches.json found but the database is empty: run `migrate` to import it."
         )
-        return
 
-    # Default: polling loop
-    notify = False
+    token = storage.get_telegram_token()
+    core = scraper.Scraper(cfg, token)
+    if core.channels:
+        logger.info(f"Output channels: {', '.join(c.name for c in core.channels)}")
+    else:
+        logger.warning("No output channel active: new items will only be logged.")
+
     try:
-        while True:
-            if _in_between(datetime.now().time(), time(active_hour), time(pause_hour)):
-                ok = scraper.refresh(queries, notify, cfg, credentials, ntfy_config)
-                notify = True
-                storage.save_queries(queries)
-                if not ok:
-                    h = cfg.bot_detection_sleep // 3600
-                    msg = f"Bot detection triggered. Polling paused for {h}h."
-                    logger.warning(msg)
-                    if notifications.is_telegram_active(credentials, cfg):
-                        notifications.send_telegram_messages([msg], credentials)
-                    if notifications.is_ntfy_active(ntfy_config, cfg):
-                        notifications.send_ntfy_messages([msg], ntfy_config)
-                    t.sleep(cfg.bot_detection_sleep)
-                    continue
-                logger.info(f"Next poll in {delay} seconds.")
-            t.sleep(delay)
+        if args.refresh:
+            core.run(storage.list_searches())
+        elif token and not cfg.no_bot:
+            run_bot(core, token, cfg)
+        else:
+            core.loop()
     except KeyboardInterrupt:
         logger.info("Stopped.")
 

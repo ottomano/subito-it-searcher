@@ -1,12 +1,18 @@
-"""Notification channels: Telegram and ntfy, both independent.
+"""Output channels: where new items are delivered. Independent of each other.
 
-Each channel has an is_*_active() guard (checks credentials exist and the
-flag is not disabled) and a send_*_messages() function. scraper.py calls
-both independently: if both are configured, both fire.
+Each channel has:
+  name                       used in logs
+  accepts(user, is_default)  whether this user's items go to this channel
+  send(user, messages)       deliver the messages
 
-Known limitation: send_telegram_messages() builds a GET URL with the message
-text inline, which can break on special characters. Switch to a POST with a
-JSON body if that becomes a problem.
+build_channels() returns the channels enabled by configuration and flags; scraper.py
+sends every user's new items to every channel that accepts that user. To add a channel,
+write a class with the same shape, add it to build_channels() and give it an
+--<name>off flag in cli.py.
+
+  telegram  HTTP POST to the user's telegram_chat_id (every user that has one)
+  ntfy      global server + topic, default user only
+  windows   toast on the machine running the scraper, default user only
 """
 
 import logging
@@ -14,50 +20,88 @@ import platform
 
 import requests
 
+from subito import storage
 from subito.config import AppConfig
 
 logger = logging.getLogger(__name__)
 
-# Windows-only toast notifications
-if platform.system() == "Windows":
-    from win10toast import ToastNotifier
 
-    _toaster = ToastNotifier()
+class TelegramChannel:
+    name = "telegram"
+
+    def __init__(self, token: str):
+        self._url = f"https://api.telegram.org/bot{token}/sendMessage"
+
+    def accepts(self, user: dict, is_default: bool) -> bool:
+        return user.get("telegram_chat_id") is not None
+
+    def send(self, user: dict, messages: list[str]) -> None:
+        chat_id = user["telegram_chat_id"]
+        for msg in messages:
+            body = {"chat_id": chat_id, "text": msg, "parse_mode": "Markdown"}
+            try:
+                r = requests.post(self._url, json=body, timeout=15)
+                if r.status_code == 400:
+                    # Titles with unbalanced * or _ break Markdown; resend as plain text
+                    del body["parse_mode"]
+                    r = requests.post(self._url, json=body, timeout=15)
+                if not r.ok:
+                    desc = r.json().get("description", r.status_code)
+                    logger.error(f"Telegram refused message to {chat_id}: {desc}")
+            except requests.RequestException as e:
+                # The exception text contains the URL, and with it the token
+                logger.error(f"Failed to send Telegram message: {type(e).__name__}")
 
 
-def is_telegram_active(credentials: dict, cfg: AppConfig) -> bool:
-    return not cfg.tgoff and "chatid" in credentials and "token" in credentials
+class NtfyChannel:
+    name = "ntfy"
+
+    def __init__(self, server: str, topic: str):
+        self._url = f"{server.rstrip('/')}/{topic}"
+
+    def accepts(self, user: dict, is_default: bool) -> bool:
+        return is_default
+
+    def send(self, user: dict, messages: list[str]) -> None:
+        for msg in messages:
+            try:
+                requests.post(self._url, data=msg.encode("utf-8"), timeout=15)
+            except Exception as e:
+                logger.error(f"Failed to send ntfy notification: {e}")
 
 
-def send_telegram_messages(messages: list, credentials: dict) -> None:
-    for msg in messages:
-        url = (
-            "https://api.telegram.org/bot"
-            + credentials["token"]
-            + "/sendMessage?chat_id="
-            + credentials["chatid"]
-            + "&parse_mode=markdown"
-            + "&text="
-            + msg
+class WindowsChannel:
+    name = "windows"
+
+    def __init__(self, toaster):
+        self._toaster = toaster
+
+    def accepts(self, user: dict, is_default: bool) -> bool:
+        return is_default
+
+    def send(self, user: dict, messages: list[str]) -> None:
+        self._toaster.show_toast(
+            "New announcements", f"{len(messages)} new item(s)", threaded=True
         )
-        requests.get(url)
 
 
-def is_ntfy_active(ntfy_config: dict, cfg: AppConfig) -> bool:
-    return (
-        not cfg.ntfyoff and "ntfy_server" in ntfy_config and "ntfy_topic" in ntfy_config
-    )
+def _windows_toaster():
+    if platform.system() != "Windows":
+        return None
+    try:
+        from win10toast import ToastNotifier
+    except ImportError:
+        logger.info("win10toast not installed, Windows notifications disabled")
+        return None
+    return ToastNotifier()
 
 
-def send_ntfy_messages(messages: list, ntfy_config: dict) -> None:
-    url = f"{ntfy_config['ntfy_server'].rstrip('/')}/{ntfy_config['ntfy_topic']}"
-    for msg in messages:
-        try:
-            requests.post(url, data=msg.encode("utf-8"))
-        except Exception as e:
-            logger.error(f"Failed to send ntfy notification: {e}")
-
-
-def notify_windows(query_name: str) -> None:
-    if platform.system() == "Windows":
-        _toaster.show_toast("New announcements", "Query: " + query_name)
+def build_channels(cfg: AppConfig, token: str | None) -> list:
+    channels = []
+    if token and not cfg.tgoff:
+        channels.append(TelegramChannel(token))
+    if not cfg.ntfyoff and (ntfy := storage.get_ntfy()):
+        channels.append(NtfyChannel(*ntfy))
+    if not cfg.winoff and (toaster := _windows_toaster()):
+        channels.append(WindowsChannel(toaster))
+    return channels

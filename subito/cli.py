@@ -1,16 +1,30 @@
 """Command-line interface: subcommands for actions, flags for run control.
 
 Subcommands: add, delete, list, migrate, setup
-Run modes (top-level flags): default polling, --refresh, --bot
+Run modes (top-level flags): default polling loop (+ Telegram bot if a token is set,
+unless --no-bot), --refresh. Output channels are switched off with --<name>off.
+
+Subcommands that act on searches take --chat-id; without it they act on the default
+user (TELEGRAM_CHAT_ID, then RESTRICT_BOT_TO_CHATID, then the local user).
 """
 
 import argparse
 
 
+def _add_chat_id(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--chat-id",
+        dest="chat_id",
+        help="Telegram chat id of the user (default: the default user)",
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Monitor subito.it and get notified when new items match your searches."
+            "Monitor subito.it and get notified when new items match your searches. "
+            "Without a subcommand, starts polling (and the Telegram bot if a token "
+            "is configured)."
         ),
     )
 
@@ -19,17 +33,15 @@ def build_parser() -> argparse.ArgumentParser:
         "-r",
         dest="refresh",
         action="store_true",
-        help="Run all searches once and exit",
+        help="Run every user's searches once, send notifications and exit",
     )
     parser.set_defaults(refresh=False)
-
     parser.add_argument(
-        "--bot",
-        dest="bot",
+        "--no-bot",
+        dest="no_bot",
         action="store_true",
-        help="Start interactive Telegram bot",
+        help="Do not answer Telegram commands (Telegram stays an output channel)",
     )
-    parser.set_defaults(bot=False)
 
     parser.add_argument(
         "--delay",
@@ -69,29 +81,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="Hour when to stop polling in 24h notation (e.g. 23 for 23:00)",
     )
 
-    # Notifications flags
-    notif = parser.add_argument_group("notifications")
-    notif.add_argument(
+    # Output channels
+    out = parser.add_argument_group("output channels")
+    out.add_argument(
         "--tgoff",
         dest="tgoff",
         action="store_true",
-        help="Disable Telegram notifications",
+        help="Disable Telegram notifications (the bot still answers commands)",
     )
-    parser.set_defaults(tgoff=False)
-    notif.add_argument(
-        "--ntfyoff",
-        dest="ntfyoff",
-        action="store_true",
-        help="Disable ntfy notifications",
+    out.add_argument(
+        "--ntfyoff", dest="ntfyoff", action="store_true", help="Disable ntfy"
     )
-    parser.set_defaults(ntfyoff=False)
-    notif.add_argument(
+    out.add_argument(
         "--winoff",
-        dest="win_notifyoff",
+        dest="winoff",
         action="store_true",
         help="Disable Windows toast notifications",
     )
-    parser.set_defaults(win_notifyoff=False)
 
     # Subcommands
     sub = parser.add_subparsers(dest="command")
@@ -116,13 +122,15 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_add.set_defaults(tuttosubito_only=False)
+    _add_chat_id(p_add)
 
     # Delete
     p_del = sub.add_parser("delete", help="Delete a search")
     p_del.add_argument("name", help="Name of the search to delete")
+    _add_chat_id(p_del)
 
     # List
-    p_list = sub.add_parser("list", help="List active searches")
+    p_list = sub.add_parser("list", help="List searches")
     p_list.add_argument(
         "--short",
         dest="short",
@@ -130,20 +138,32 @@ def build_parser() -> argparse.ArgumentParser:
         help="Compact output",
     )
     p_list.set_defaults(short=False)
+    _add_chat_id(p_list)
+    p_list.add_argument(
+        "--all", dest="all", action="store_true", help="List every user's searches"
+    )
 
     # Migrate
-    sub.add_parser(
+    p_mig = sub.add_parser(
         "migrate",
-        help="Migrate searches.tracked from old nested format to the new format",
+        help="Import searches.json, telegram.json and ntfy.json into SQLite",
+    )
+    p_mig.add_argument(
+        "--chat-id",
+        dest="chat_id",
+        help="Owner of the imported searches (default: the default user, which is "
+        "the chatid in telegram.json unless TELEGRAM_CHAT_ID says otherwise)",
     )
 
     # Setup
-    p_setup = sub.add_parser("setup", help="Configure notification channels")
-
+    p_setup = sub.add_parser("setup", help="Configure Telegram and ntfy")
     tg = p_setup.add_argument_group("telegram")
     tg.add_argument("--telegram-token", dest="token", help="Telegram bot API token")
-    tg.add_argument("--telegram-chat-id", dest="chatid", help="Telegram chat id")
-
+    tg.add_argument(
+        "--telegram-chat-id",
+        dest="telegram_chat_id",
+        help="Chat or @channel receiving the default user's notifications",
+    )
     ntfy = p_setup.add_argument_group("ntfy")
     ntfy.add_argument("--ntfy-server", dest="ntfy_server", help="ntfy server URL")
     ntfy.add_argument("--ntfy-topic", dest="ntfy_topic", help="ntfy topic")
