@@ -1,81 +1,205 @@
-# Improved version of subito-it-searcher
+# subito-it-searcher
 
-BeautifulSoup scraper running queries on a popular italian ad website.
-This searcher is compatible with Python 3.x versions.
+Monitor subito.it and get notified when new items match your searches.
 
-Features (thanks to Marco Perronet)
-* Infinite refresh with adjustable delay
-* Multiplatform support: can run also on Windows
-* Windows 10 notifications
-* Easier Telegram setup
-* Handle connection errors
-* Fix flooding on Telegram
+## Features
+
+- Continuous polling with configurable delay and active time window
+- Price range filtering per query
+- Independent output channels: **Telegram**, **[ntfy](https://ntfy.sh)**, Windows
+  toast; use any combination
+- Optional **Telegram bot** to manage searches from a chat, single or multi-user
+- SQLite storage in a single file
+- Docker support
 
 ## Setup
 
-### Install dependencies 
-```pip3 install -r requirements.txt```
+### Install dependencies
 
-NB: For Windows 10 users, install also ```win10toast```.
+```bash
+pip3 install -r requirements.txt
+```
 
-### Telegram configuration
-To have to bot send you updates on Telegram, follow these steps:
-1) Create a bot by writing to the BotFather on Telegram
-2) BotFather will give you an API key: **save this API key for later**
-3) Create a public channel and add the newly created bot as administrator
-4) **Save the name of the channel** including the "@", for example: @subito_bot
+For Windows notifications, also install `win10toast`.
 
-To configure Telegram, simply invoke the script with the proper parameters as following:
+### Telegram
 
-`python3 subito-searcher.py --addtoken [YOUR_API_TOKEN] --addchatid [YOUR_CHANNEL_NAME]`
+1. Create a bot via [@BotFather](https://t.me/botfather). It will give you an API token
+2. Save the token and the chat (or `@channel`) that receives notifications, or set
+   `TELEGRAM_TOKEN` and `TELEGRAM_CHAT_ID`:
+
+   ```bash
+   python3 subito-searcher.py setup --telegram-token "YOUR_TOKEN" --telegram-chat-id "123456"
+   ```
+
+3. To keep the bot private, set `RESTRICT_BOT_TO_CHATID` to your chat id. If
+   `TELEGRAM_CHAT_ID` is not set, notifications go to that same chat
+
+Get your chat id from [@userinfobot](https://t.me/userinfobot), or start the bot with
+`RESTRICT_BOT_TO_CHATID` set to any number and read
+`Ignored update from unauthorized chat <id>` in the log.
+
+| I want | Configuration |
+| --- | --- |
+| notifications in the chat where I command the bot | `RESTRICT_BOT_TO_CHATID=<my chat>` |
+| commands in private, notifications on a channel | `RESTRICT_BOT_TO_CHATID=<my chat>`, `TELEGRAM_CHAT_ID=@channel` |
+| Telegram only for notifications | `TELEGRAM_CHAT_ID=<chat>`, run with `--no-bot` |
+| a bot open to anyone, each with own searches | no `RESTRICT_BOT_TO_CHATID` |
+
+### ntfy
+
+[ntfy](https://ntfy.sh) is a simple HTTP push notification service:
+
+```bash
+python3 subito-searcher.py setup --ntfy-server https://ntfy.sh --ntfy-topic your_topic
+```
+
+ntfy and Windows toasts receive the searches of the default user: the one of
+`TELEGRAM_CHAT_ID` (or `RESTRICT_BOT_TO_CHATID`), or the local user when Telegram is
+not configured at all.
+
+### Environment variables
+
+Env vars take priority over the values stored in the database.
+
+|         Variable         |                              Description                              |
+| ------------------------ | --------------------------------------------------------------------- |
+| `TELEGRAM_TOKEN`         | Telegram bot API token                                                |
+| `TELEGRAM_CHAT_ID`       | Chat or `@channel` receiving notifications                            |
+| `RESTRICT_BOT_TO_CHATID` | Answer only this chat id; fallback for `TELEGRAM_CHAT_ID`             |
+| `NTFY_SERVER`            | ntfy server URL                                                       |
+| `NTFY_TOPIC`             | ntfy topic                                                            |
+| `DELAY`                  | Polling interval in seconds (default: 120)                            |
+| `ACTIVE_HOUR`            | Hour when to start polling in 24h notation                            |
+| `PAUSE_HOUR`             | Hour when to stop polling in 24h notation                             |
+| `QUERY_DELAY`            | Seconds between queries to avoid anti-bot detection (default: 60)     |
+| `BOT_DETECTION_SLEEP`    | Seconds to pause after bot detection (default: 86400)                 |
+
+### Docker
+
+```bash
+docker build -t subito-searcher .
+docker run -v ./data:/app/data -e TELEGRAM_TOKEN=... subito-searcher <flags>
+```
+
+Docker Compose:
+
+```yaml
+services:
+  subito-searcher:
+    build: .
+    volumes:
+      - ./data:/app/data
+    environment:
+      - TELEGRAM_TOKEN=${TELEGRAM_TOKEN}
+      - RESTRICT_BOT_TO_CHATID=${RESTRICT_BOT_TO_CHATID}
+```
 
 ## Usage
-Write `python3 subito-searcher.py --help` to see all the command line arguments. Keep in mind that the script *always* needs some argument in order to start. 
 
-Here is a cheatsheet of the most common usages:
-
-* Add a new query with name "Auto":
-`python3 subito-searcher.py --add Auto --url https://www.subito.it/annunci-italia/vendita/usato/?q=auto --minPrice 50 --maxPrice 100`
-(keep in mind that you *always* use `--add` and `--url` together, min and max prices are optional)
-
-* Remove the query "Auto":
-`python3 subito-searcher.py --delete Auto`
-
-* See a list of all your added queries:
-`python3 subito-searcher.py --short_list`
-
-* **Start the bot**, it will search for new announcements every 2 minutes:
-`python3 subito-searcher.py --daemon`
-
-* Start the bot with a custom delay (example, 30 seconds):
-`python3 subito-searcher.py --daemon --delay 30`
-
-* Start the bot, but disable windows notifications:
-`python3 subito-searcher.py --notifyoff`
-
-* Start the bot, but disable telegram messages:
-`python3 subito-searcher.py --tgoff`
-
-## Example setup
-
-Here is the list of commands I types to set up the bot on my computer:
+```bash
+python3 subito-searcher.py --help
+python3 subito-searcher.py <subcommand> --help
 ```
-python3 subito-searcher.py --addtoken "6168613223:oij9JDXXlipj92jDj0j90JFWO292" --addchatid "@subito_it_test"
-python3 subito-searcher.py --add Auto --url https://www.subito.it/annunci-italia/vendita/usato/\?q\=auto
-python3 subito-searcher.py --add Iphone --url https://www.subito.it/annunci-italia/vendita/usato/\?q\=iphone
-python3 subito-searcher.py --add ScarpeMaxMin --url https://www.subito.it/annunci-italia/vendita/usato/\?q\=auto --minPrice 10 --maxPrice 150
-python3 subito-searcher.py --daemon --delay 10
+
+### Run modes
+
+```bash
+# Poll all searches; with a Telegram token the bot also answers commands
+python3 subito-searcher.py
+
+# Custom polling interval and active time window
+python3 subito-searcher.py --delay 300 --active-hour 8 --pause-hour 23
+
+# Poll without answering Telegram commands
+python3 subito-searcher.py --no-bot
+
+# Run every search once, send notifications and exit
+python3 subito-searcher.py --refresh
 ```
-(Of course the token I showed here is not the real one)
 
-"Auto", "Iphone", and "Scarpe" are very common queries, so hopefully you should see some notifications on Telegram!
+### Output channel flags
 
-If you want to check if your bot is able to receive messages, you can use this link to send a test message: https://api.telegram.org/bot[bot_token_code]/sendMessage?chat_id=[chat_id_code]&text=prova (please use your token and chat id in the link).
+```bash
+--tgoff    # Disable Telegram notifications (the bot still answers commands)
+--ntfyoff  # Disable ntfy notifications
+--winoff   # Disable Windows toast notifications
+```
 
-For example, I used: https://api.telegram.org/6168613223:oij9JDXXlipj92jDj0j90JFWO292/sendMessage?chat_id=@subito_it_test&text=Ciao
+### Bot commands
 
-### Troubleshooting
+| Command | Description |
+| --- | --- |
+| `/list` | Show your searches |
+| `/add <name> <url> [min] [max] [tuttosubito]` | Add a search |
+| `/delete <name>` | Remove a search |
+| `/refresh` | Run your searches now |
+| `/status` | Show state, last run, delay, active window, output channels |
+| `/help` | List all commands |
 
-* Did you add the bot to the channel and set it as admin?
-* Did you use the correct chat id? Don't forget the "@" at the beginning (e.g. `@subito_it_test`)
-* Be patient! Maybe it will take a few minutes to receive notifications. Did you use a common query where people post announcments like "Auto"? For testing, try also setting a low delay (e.g. `python3 subito-searcher.py --daemon --delay 10`)
+The easiest way to add a search is to set up the filters on subito.it in the browser
+and paste the resulting URL. When a search is added, its current listings are stored
+without notifying them; from then on only new listings are sent.
+
+### Manage searches from the command line
+
+Without `--chat-id`, the commands act on the default user.
+
+```bash
+# Add a search (all filters optional)
+python3 subito-searcher.py add Auto "https://www.subito.it/annunci-italia/vendita/usato/?q=auto"
+python3 subito-searcher.py add Iphone "https://www.subito.it/annunci-italia/vendita/usato/?q=iphone" --min-price 50 --max-price 300
+# Add with shipping (use native URL filter) + TuttoSubito buyer protection
+python3 subito-searcher.py add Iphone "https://www.subito.it/annunci-italia/vendita/usato/?q=iphone&shp=true" --tuttosubito
+
+# Remove a search
+python3 subito-searcher.py delete Auto
+
+# List searches
+python3 subito-searcher.py list
+python3 subito-searcher.py list --short
+python3 subito-searcher.py list --all    # every user
+```
+
+### Migration
+
+Versions before SQLite stored state in `searches.json`, `telegram.json` and `ntfy.json`.
+Import them once; token, chat id and ntfy go to the settings, searches to the default
+user (or to `--chat-id`):
+
+```bash
+python3 subito-searcher.py migrate
+```
+
+## Project structure
+
+```text
+subito-searcher.py      # Entry point: parse args, build config, dispatch
+subito/
+  scraper.py            # Core: fetch, parse, diff + Scraper runtime
+  notifications.py      # Output channels: telegram, ntfy, windows
+  bot.py                # Telegram command interface
+  queries.py            # Formatting and print helpers
+  storage.py            # SQLite schema and queries + legacy JSON import
+  cli.py                # Subcommands and flags
+  config.py             # Paths and AppConfig dataclass
+data/                   # Gitignored, Docker volume
+  subito.db
+  errors.log
+```
+
+## Logs
+
+Warnings and errors are written to `data/errors.log` (rotating, 1 MB max, 3 backups).
+Check this file if searches stop returning results or items are being silently skipped.
+
+## Troubleshooting
+
+- **Bot does not answer**: check `RESTRICT_BOT_TO_CHATID`; updates from other chats
+  are logged and ignored
+- **No Telegram messages on a channel**: the bot must be an administrator of the
+  channel
+- **No items found**: subito.it embeds results in a `__NEXT_DATA__` script tag. If the
+  site redesigns, update the JSON path in `subito/scraper.py`
+- **Bot detection**: polling pauses for `BOT_DETECTION_SLEEP` seconds and every user
+  with searches is told. Open subito.it in a browser and solve any captcha

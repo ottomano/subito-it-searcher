@@ -1,3 +1,23 @@
-telegram-send.conf
-searches.tracked
-telegram_api_credentials
+# virtualenv
+.venv/
+
+# data volume (credentials and state files)
+data/
+
+# python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+.ruff_cache
+
+# uv / pip
+.python-version
+
+# ide
+.vscode/
+.idea/
+
+# Claude
+.claude
